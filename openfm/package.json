@@ -17,7 +17,7 @@
     "architectures": [
       "amd64",
       "armhf",
-      "arm64"
+      "i386"
     ],
     "os": [
       "bookworm"
