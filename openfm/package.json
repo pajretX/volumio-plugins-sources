@@ -1,6 +1,6 @@
 {
   "name": "openfm",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Open FM internet radio (open.fm) for Volumio",
   "main": "index.js",
   "scripts": {
@@ -23,7 +23,7 @@
       "bookworm"
     ],
     "details": "Internet radio from open.fm (categories, stations, token-signed streams) for Volumio.",
-    "changelog": "White concentric-circles source icon (500x500), working settings UI (setUIConfig), standard v-conf config schema"
+    "changelog": "Fix category truncation (fetch full station lists from API), add standalone streams support (Radio ZET, Antyradio, etc. via StreamTheWorld), badge Premium stations with toast alert"
   },
   "engines": {
     "node": ">=20",

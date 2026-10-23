@@ -24,6 +24,9 @@ var PKG_VERSION = require('./package.json').version;
 
 var USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 var API_STATIONS = 'https://open.fm/api/radio/stations';
+var API_STANDALONE = 'https://open.fm/api/radio/standalone-stations';
+var API_CATEGORIES = 'https://open.fm/api/radio/categories';
+var API_CATEGORY_PREFIX = 'https://open.fm/api/radio/category/';
 var PAGE_URL = 'https://open.fm/';
 var TOKEN_URL = 'https://open.fm/api/user/token?fp=';
 
@@ -43,6 +46,8 @@ function ControllerOpenFM(context) {
   this._stationsCacheTime = 0;
   this._categoriesCache = null;
   this._categoriesCacheTime = 0;
+  this._categoryStationsCache = {};
+  this._categoryStationsCacheTime = {};
 
   this._metaProc = null;
   this._metaBuffer = Buffer.alloc(0);
@@ -242,16 +247,38 @@ ControllerOpenFM.prototype.getStations = function () {
     return defer.promise;
   }
 
-  self.httpGet(API_STATIONS).then(function (body) {
+  libQ.all([
+    self.httpGet(API_STATIONS),
+    self.httpGet(API_STANDALONE).fail(function (err) {
+      self.logger.warn('[openfm] standalone stations fetch failed: ' + err);
+      return '[]';
+    })
+  ]).then(function (results) {
     var stations = {};
     try {
-      stations = JSON.parse(body);
+      stations = JSON.parse(results[0]);
     } catch (e) {
       self.logger.error('[openfm] failed to parse stations: ' + e);
     }
+    try {
+      var standalone = JSON.parse(results[1]);
+      if (Array.isArray(standalone)) {
+        for (var i = 0; i < standalone.length; i++) {
+          var item = standalone[i];
+          var sid = String(item.id);
+          if (stations[sid]) {
+            stations[sid].streamUrl = item.streamUrl;
+            stations[sid].isStandalone = true;
+            if (item.urlType) stations[sid].urlType = item.urlType;
+          }
+        }
+      }
+    } catch (e) {
+      self.logger.warn('[openfm] failed to parse standalone stations: ' + e);
+    }
     self._stationsCache = stations;
     self._stationsCacheTime = now;
-    self.logger.info('[openfm] loaded ' + Object.keys(stations).length + ' stations');
+    self.logger.info('[openfm] loaded ' + Object.keys(stations).length + ' stations (with standalone overrides)');
     defer.resolve(stations);
   }).fail(function (err) {
     self.logger.error('[openfm] stations fetch failed: ' + err);
@@ -270,32 +297,84 @@ ControllerOpenFM.prototype.getCategories = function () {
     return defer.promise;
   }
 
-  self.httpGet(PAGE_URL).then(function (html) {
+  self.httpGet(API_CATEGORIES).then(function (body) {
     var cats = [];
-    var m = html.match(/<script id="__NEXT_DATA__" type="application\/json"[^>]*>([\s\S]*?)<\/script>/);
-    if (m) {
-      try {
-        var d = JSON.parse(m[1]);
-        var raw = d.props.pageProps.fallback.categories;
-        for (var i = 0; i < raw.length; i++) {
-          var c = raw[i];
-          cats.push({
-            id: c.id,
-            name: String(c.name).replace(EMOJI_RE, '').trim(),
-            slug: c.slug,
-            stations: c.stations
-          });
-        }
-      } catch (e) {
-        self.logger.error('[openfm] failed to parse categories: ' + e);
+    try {
+      var raw = JSON.parse(body);
+      for (var i = 0; i < raw.length; i++) {
+        var c = raw[i];
+        cats.push({
+          id: c.id,
+          name: String(c.name).replace(EMOJI_RE, '').trim(),
+          slug: c.slug
+        });
       }
+    } catch (e) {
+      self.logger.error('[openfm] failed to parse categories JSON: ' + e);
     }
     self._categoriesCache = cats;
     self._categoriesCacheTime = now;
-    self.logger.info('[openfm] loaded ' + cats.length + ' categories');
+    self.logger.info('[openfm] loaded ' + cats.length + ' categories from API');
     defer.resolve(cats);
   }).fail(function (err) {
-    self.logger.error('[openfm] categories fetch failed: ' + err);
+    self.logger.warn('[openfm] categories API fetch failed (' + err + '), trying page scraper');
+    self.httpGet(PAGE_URL).then(function (html) {
+      var cats = [];
+      var m = html.match(/<script id="__NEXT_DATA__" type="application\/json"[^>]*>([\s\S]*?)<\/script>/);
+      if (m) {
+        try {
+          var d = JSON.parse(m[1]);
+          var raw = d.props.pageProps.fallback.categories;
+          for (var i = 0; i < raw.length; i++) {
+            var c = raw[i];
+            cats.push({
+              id: c.id,
+              name: String(c.name).replace(EMOJI_RE, '').trim(),
+              slug: c.slug
+            });
+          }
+        } catch (e) {
+          self.logger.error('[openfm] failed to parse fallback categories: ' + e);
+        }
+      }
+      self._categoriesCache = cats;
+      self._categoriesCacheTime = now;
+      defer.resolve(cats);
+    }).fail(function (pageErr) {
+      self.logger.error('[openfm] categories scraper fallback failed: ' + pageErr);
+      defer.reject(pageErr);
+    });
+  });
+  return defer.promise;
+};
+
+ControllerOpenFM.prototype.getCategoryStations = function (slug) {
+  var self = this;
+  var defer = libQ.defer();
+  var now = Date.now();
+
+  if (self._categoryStationsCache[slug] && (now - (self._categoryStationsCacheTime[slug] || 0)) < self.getCacheTtlMs()) {
+    defer.resolve(self._categoryStationsCache[slug]);
+    return defer.promise;
+  }
+
+  var url = API_CATEGORY_PREFIX + encodeURIComponent(slug);
+  self.httpGet(url).then(function (body) {
+    var stationIds = [];
+    try {
+      var d = JSON.parse(body);
+      if (Array.isArray(d.items)) {
+        stationIds = d.items;
+      }
+    } catch (e) {
+      self.logger.error('[openfm] failed to parse category stations for ' + slug + ': ' + e);
+    }
+    self._categoryStationsCache[slug] = stationIds;
+    self._categoryStationsCacheTime[slug] = now;
+    self.logger.info('[openfm] loaded ' + stationIds.length + ' stations for category ' + slug);
+    defer.resolve(stationIds);
+  }).fail(function (err) {
+    self.logger.error('[openfm] category stations fetch failed for ' + slug + ': ' + err);
     defer.reject(err);
   });
   return defer.promise;
@@ -304,6 +383,12 @@ ControllerOpenFM.prototype.getCategories = function () {
 ControllerOpenFM.prototype.resolveStreamUrl = function (streamUrl) {
   var self = this;
   var defer = libQ.defer();
+
+  if (streamUrl.indexOf('stream-cdn-1.open.fm') === -1 && streamUrl.indexOf('.m3u8') === -1) {
+    defer.resolve(streamUrl);
+    return defer.promise;
+  }
+
   var tokenUrl = TOKEN_URL + encodeURIComponent(streamUrl);
 
   self.httpGet(tokenUrl).then(function (body) {
@@ -395,10 +480,15 @@ ControllerOpenFM.prototype.browseCategory = function (catId) {
       defer.reject(new Error('category not found: ' + catId));
       return;
     }
-    self.getStations().then(function (stations) {
+    libQ.all([
+      self.getCategoryStations(cat.slug),
+      self.getStations()
+    ]).then(function (results) {
+      var stationIds = results[0];
+      var stations = results[1];
       var items = [];
-      for (var i = 0; i < cat.stations.length; i++) {
-        var st = stations[String(cat.stations[i])];
+      for (var i = 0; i < stationIds.length; i++) {
+        var st = stations[String(stationIds[i])];
         if (!st) continue;
         items.push(self.stationItem(st));
       }
@@ -453,13 +543,14 @@ ControllerOpenFM.prototype.browseAllStations = function () {
 };
 
 ControllerOpenFM.prototype.stationItem = function (st) {
+  var isPremium = !!st.premium;
   return {
     service: 'openfm',
     type: 'song',
-    title: st.name,
-    artist: 'Open FM',
+    title: isPremium ? (st.name + ' [Premium]') : st.name,
+    artist: isPremium ? 'Open FM Premium' : 'Open FM',
     album: '',
-    icon: 'fa fa-music',
+    icon: isPremium ? 'fa fa-star' : 'fa fa-music',
     uri: 'openfm/station/' + st.id,
     albumart: st.logoUrl
   };
@@ -486,6 +577,19 @@ ControllerOpenFM.prototype.explodeUri = function (uri) {
     var st = stations[String(sid)];
     if (!st) {
       defer.reject(new Error('station not found: ' + sid));
+      return;
+    }
+    if (st.premium) {
+      var lang = 'en';
+      try { lang = self.commandRouter.sharedVars.get('language_code'); } catch (e) {}
+      var msg = (lang === 'pl')
+        ? ('Stacja "' + st.name + '" wymaga subskrypcji Open FM Premium.')
+        : ('Station "' + st.name + '" requires an Open FM Premium subscription.');
+      try {
+        self.commandRouter.pushToastMessage('warning', 'Open FM Premium', msg);
+      } catch (e) {}
+      self.logger.warn('[openfm] playback rejected: ' + msg);
+      defer.reject(new Error(msg));
       return;
     }
     self.resolveStreamUrl(st.streamUrl).then(function (signedUrl) {
@@ -541,7 +645,9 @@ ControllerOpenFM.prototype.clearAddPlayTrack = function (track) {
       return self.mpdPlugin.sendMpdCommand('play', []);
     })
     .then(function () {
-      self._startMetadataReader();
+      if (self._playUri && self._playUri.indexOf('.m3u8') !== -1) {
+        self._startMetadataReader();
+      }
       self._pushNowPlaying();
       self._startSeekTimer();
       // The core playback timer was started by play() before clearAddPlayTrack,
